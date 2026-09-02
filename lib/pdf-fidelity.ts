@@ -45,6 +45,7 @@ export type OutputPlan = {
 type PdfJs = typeof import('pdfjs-dist');
 
 let pdfJsPromise: Promise<PdfJs> | null = null;
+const localPdfUrls = new WeakMap<PDFDocumentProxy, string>();
 
 export async function getPdfJs(): Promise<PdfJs> {
   if (!pdfJsPromise) {
@@ -72,29 +73,58 @@ export async function openLocalPdf(
 ): Promise<PDFDocumentProxy> {
   const pdfjs = await getPdfJs();
   const assetBase = new URL('pdfjs/', window.location.href).toString();
-  const bytes = new Uint8Array(await file.arrayBuffer());
+  const localUrl = URL.createObjectURL(file);
   const loadingTask: PDFDocumentLoadingTask = pdfjs.getDocument({
-    data: bytes,
+    url: localUrl,
     cMapUrl: `${assetBase}cmaps/`,
     cMapPacked: true,
     iccUrl: `${assetBase}iccs/`,
     standardFontDataUrl: `${assetBase}standard_fonts/`,
     wasmUrl: `${assetBase}wasm/`,
     useSystemFonts: true,
+    useWasm: true,
+    isOffscreenCanvasSupported: typeof OffscreenCanvas !== 'undefined',
+    isImageDecoderSupported: typeof ImageDecoder !== 'undefined',
+    enableHWA: true,
   });
 
-  loadingTask.onPassword = (updatePassword: (password: string) => void, reason: number) => {
+  loadingTask.onPassword = (
+    updatePassword: (password: string) => void,
+    reason: number,
+  ) => {
     const password = onPassword(reason);
     if (password === null) {
-      loadingTask.destroy();
+      void loadingTask.destroy();
       return;
     }
     updatePassword(password);
   };
-  loadingTask.onProgress = ({ loaded, total }: { loaded: number; total: number }) =>
-    onProgress?.(loaded, total || file.size);
+  loadingTask.onProgress = ({
+    loaded,
+    total,
+  }: {
+    loaded: number;
+    total: number;
+  }) => onProgress?.(loaded, total || file.size);
 
-  return loadingTask.promise;
+  try {
+    const pdf = await loadingTask.promise;
+    localPdfUrls.set(pdf, localUrl);
+    return pdf;
+  } catch (error) {
+    URL.revokeObjectURL(localUrl);
+    throw error;
+  }
+}
+
+export async function closeLocalPdf(pdf: PDFDocumentProxy): Promise<void> {
+  const localUrl = localPdfUrls.get(pdf);
+  localPdfUrls.delete(pdf);
+  try {
+    await pdf.loadingTask.destroy();
+  } finally {
+    if (localUrl) URL.revokeObjectURL(localUrl);
+  }
 }
 
 function multiply(left: Matrix, right: Matrix): Matrix {
@@ -112,7 +142,9 @@ function isMatrix(value: unknown): value is Matrix {
   return (
     Array.isArray(value) &&
     value.length >= 6 &&
-    value.slice(0, 6).every((entry) => typeof entry === 'number' && Number.isFinite(entry))
+    value
+      .slice(0, 6)
+      .every((entry) => typeof entry === 'number' && Number.isFinite(entry))
   );
 }
 
@@ -133,10 +165,14 @@ function getPdfObject(page: PDFPageProxy, objectId: string): Promise<unknown> {
 }
 
 function asPositiveNumber(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? value
+    : null;
 }
 
-export async function scanPage(page: PDFPageProxy): Promise<Omit<PageScan, 'previewUrl'>> {
+export async function scanPage(
+  page: PDFPageProxy,
+): Promise<Omit<PageScan, 'previewUrl'>> {
   const pdfjs = await getPdfJs();
   const viewport = page.getViewport({ scale: 1 });
   const [operatorList, textContent] = await Promise.all([
@@ -166,7 +202,10 @@ export async function scanPage(page: PDFPageProxy): Promise<Omit<PageScan, 'prev
     const placedHeight = Math.hypot(placement[2], placement[3]) * userUnit;
     if (placedWidth < 1e-6 || placedHeight < 1e-6) return;
 
-    const requiredScale = Math.max(nativeWidth / placedWidth, nativeHeight / placedHeight);
+    const requiredScale = Math.max(
+      nativeWidth / placedWidth,
+      nativeHeight / placedHeight,
+    );
     if (!Number.isFinite(requiredScale) || requiredScale <= 0) return;
 
     imageCount += Math.max(1, Math.round(instances));
@@ -222,8 +261,10 @@ export async function scanPage(page: PDFPageProxy): Promise<Omit<PageScan, 'prev
       const annotationTransform = args[2];
       const annotationMatrix = args[3];
       current = [1, 0, 0, 1, 0, 0];
-      if (isMatrix(annotationTransform)) current = multiply(current, annotationTransform);
-      if (isMatrix(annotationMatrix)) current = multiply(current, annotationMatrix);
+      if (isMatrix(annotationTransform))
+        current = multiply(current, annotationTransform);
+      if (isMatrix(annotationMatrix))
+        current = multiply(current, annotationMatrix);
       continue;
     }
     if (operation === pdfjs.OPS.endAnnotation) {
@@ -236,12 +277,16 @@ export async function scanPage(page: PDFPageProxy): Promise<Omit<PageScan, 'prev
       continue;
     }
     if (operation === pdfjs.OPS.paintInlineImageXObject) {
-      const image = args[0] as { width?: unknown; height?: unknown } | undefined;
+      const image = args[0] as
+        | { width?: unknown; height?: unknown }
+        | undefined;
       addRaster(image?.width, image?.height, current);
       continue;
     }
     if (operation === pdfjs.OPS.paintInlineImageXObjectGroup) {
-      const image = args[0] as { width?: unknown; height?: unknown } | undefined;
+      const image = args[0] as
+        | { width?: unknown; height?: unknown }
+        | undefined;
       const entries = (args[1] ?? []) as Array<{
         transform?: unknown;
         w?: unknown;
@@ -270,8 +315,15 @@ export async function scanPage(page: PDFPageProxy): Promise<Omit<PageScan, 'prev
       pendingRasterObjects.push(
         getPdfObject(page, objectId)
           .then((image) => {
-            const dimensions = image as { width?: unknown; height?: unknown } | undefined;
-            addRaster(dimensions?.width, dimensions?.height, placement, instances);
+            const dimensions = image as
+              | { width?: unknown; height?: unknown }
+              | undefined;
+            addRaster(
+              dimensions?.width,
+              dimensions?.height,
+              placement,
+              instances,
+            );
           })
           .catch(() => undefined),
       );
@@ -322,12 +374,17 @@ export async function scanPage(page: PDFPageProxy): Promise<Omit<PageScan, 'prev
       transform: Array<number>;
     };
     if (!textItem.str.trim()) continue;
-    const measuredHeight = Math.abs(textItem.height || Math.hypot(textItem.transform[2], textItem.transform[3]));
+    const measuredHeight = Math.abs(
+      textItem.height ||
+        Math.hypot(textItem.transform[2], textItem.transform[3]),
+    );
     const physicalHeight = measuredHeight * userUnit;
     if (!Number.isFinite(physicalHeight) || physicalHeight <= 1e-5) continue;
     textCount += 1;
     minimumTextHeight =
-      minimumTextHeight === null ? physicalHeight : Math.min(minimumTextHeight, physicalHeight);
+      minimumTextHeight === null
+        ? physicalHeight
+        : Math.min(minimumTextHeight, physicalHeight);
   }
 
   return {
@@ -342,7 +399,10 @@ export async function scanPage(page: PDFPageProxy): Promise<Omit<PageScan, 'prev
   };
 }
 
-export function planOutput(scan: PageScan, settings: FidelitySettings): OutputPlan {
+export function planOutput(
+  scan: PageScan,
+  settings: FidelitySettings,
+): OutputPlan {
   const vectorScale = settings.vectorDpi / 72;
   const textScale = scan.minimumTextHeight
     ? settings.minimumTextPixels / scan.minimumTextHeight
@@ -351,7 +411,8 @@ export function planOutput(scan: PageScan, settings: FidelitySettings): OutputPl
   const scale = Math.max(1, vectorScale, textScale, imageScale);
 
   let driver: OutputPlan['driver'] = 'vector';
-  if (imageScale >= vectorScale && imageScale >= textScale && imageScale > 0) driver = 'image';
+  if (imageScale >= vectorScale && imageScale >= textScale && imageScale > 0)
+    driver = 'image';
   else if (textScale >= vectorScale && textScale > 0) driver = 'text';
 
   const width = Math.max(1, Math.ceil(scan.baseWidth * scale));
@@ -368,19 +429,25 @@ export function planOutput(scan: PageScan, settings: FidelitySettings): OutputPl
   };
 }
 
-export async function createPagePreview(page: PDFPageProxy): Promise<string> {
+export async function createPagePreview(
+  page: PDFPageProxy,
+  maximumWidth = 720,
+): Promise<string> {
   const baseViewport = page.getViewport({ scale: 1 });
-  const previewScale = Math.min(1.35, 720 / Math.max(baseViewport.width, 1));
+  const previewScale = Math.min(
+    1.35,
+    maximumWidth / Math.max(baseViewport.width, 1),
+  );
   const viewport = page.getViewport({ scale: previewScale });
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.ceil(viewport.width));
   canvas.height = Math.max(1, Math.ceil(viewport.height));
   const context = canvas.getContext('2d', { alpha: false });
-  if (!context) throw new Error('Die Browser-Zeichenfläche konnte nicht geöffnet werden.');
+  if (!context)
+    throw new Error('Die Browser-Zeichenfläche konnte nicht geöffnet werden.');
 
   await page.render({
     canvas,
-    canvasContext: context,
     viewport,
     background: '#ffffff',
   }).promise;
@@ -390,6 +457,7 @@ export async function createPagePreview(page: PDFPageProxy): Promise<string> {
   );
   canvas.width = 1;
   canvas.height = 1;
-  if (!blob) throw new Error('Die Seitenvorschau konnte nicht erstellt werden.');
+  if (!blob)
+    throw new Error('Die Seitenvorschau konnte nicht erstellt werden.');
   return URL.createObjectURL(blob);
 }
