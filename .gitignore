@@ -34,6 +34,8 @@ yarn-error.log*
 next-env.d.ts
 *.tsbuildinfo
 /dist/
+/dist-desktop/
+/src-tauri/target/
 /.wrangler/
 /outputs/
 /work/

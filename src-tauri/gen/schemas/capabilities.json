@@ -1,0 +1,1 @@
+{"main-window":{"identifier":"main-window","description":"Minimale Rechte für lokale Datei-Dialoge","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save"]}}

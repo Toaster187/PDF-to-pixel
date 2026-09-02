@@ -1,3 +1,12 @@
+import {
+  abortNativeExport,
+  beginNativeExport,
+  finishNativeExport,
+  isNativeDesktop,
+  pickNativeExportPath,
+  writeNativeExport,
+} from '@/lib/native-desktop';
+
 export type ExportTarget = {
   mode: 'direct' | 'memory';
   write: (chunk: Uint8Array) => Promise<void>;
@@ -35,6 +44,21 @@ export async function createExportTarget(
   filename: string,
   mimeType: string,
 ): Promise<ExportTarget | null> {
+  if (isNativeDesktop()) {
+    const path = await pickNativeExportPath(filename, mimeType);
+    if (!path) return null;
+    await beginNativeExport(path);
+    return {
+      mode: 'direct',
+      write: writeNativeExport,
+      finish: async () => {
+        await finishNativeExport();
+        return null;
+      },
+      abort: abortNativeExport,
+    };
+  }
+
   const pickerWindow = window as SavePickerWindow;
   const picker = pickerWindow.showSaveFilePicker;
   if (typeof picker === 'function') {

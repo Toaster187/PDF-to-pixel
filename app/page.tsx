@@ -26,9 +26,11 @@ import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import {
   getDevicePerformanceProfile,
+  initializeNativePerformanceProfile,
   yieldToBrowser,
 } from '@/lib/device-performance';
 import { createExportTarget } from '@/lib/export-target';
+import { isNativeDesktop, pickNativePdf } from '@/lib/native-desktop';
 import {
   closeLocalPdf,
   createPagePreview,
@@ -122,10 +124,12 @@ function driverLabel(driver: OutputPlan['driver']): string {
 function SettingsPanel({
   settings,
   onChange,
+  native,
   disabled,
 }: {
   settings: FidelitySettings;
   onChange: (settings: FidelitySettings) => void;
+  native?: boolean;
   disabled?: boolean;
 }) {
   return (
@@ -246,9 +250,9 @@ function SettingsPanel({
       <div className="mt-3 flex gap-3 rounded-2xl border border-emerald-100 bg-emerald-50 p-4 text-emerald-950">
         <Gauge className="mt-0.5 size-4 shrink-0 text-emerald-700" />
         <p className="text-xs leading-5">
-          Windows und Android nutzen automatisch Hardware-Rendering, native
-          PNG-Kompression und direktes Schreiben auf den Datenträger, soweit der
-          Browser es unterstützt.
+          {native
+            ? 'Die Windows-App erkennt CPU und Arbeitsspeicher, parallelisiert die Analyse und streamt Exporte ohne Browserlimit direkt auf den Datenträger.'
+            : 'Windows und Android nutzen automatisch Hardware-Rendering, native PNG-Kompression und direktes Schreiben auf den Datenträger, soweit der Browser es unterstützt.'}
         </p>
       </div>
     </aside>
@@ -257,10 +261,12 @@ function SettingsPanel({
 
 function DropSurface({
   onFile,
+  onNativePick,
   dragging,
   onDraggingChange,
 }: {
   onFile: (file: File) => void;
+  onNativePick?: () => void;
   dragging: boolean;
   onDraggingChange: (dragging: boolean) => void;
 }) {
@@ -287,7 +293,9 @@ function DropSurface({
             : 'border-primary/40 hover:border-primary hover:shadow-[0_32px_90px_rgb(36_75_255/12%)]'
         }`}
         aria-label="PDF-Datei auswählen oder hier ablegen"
-        onClick={() => inputRef.current?.click()}
+        onClick={() =>
+          onNativePick ? onNativePick() : inputRef.current?.click()
+        }
         onDragEnter={(event) => {
           event.preventDefault();
           onDraggingChange(true);
@@ -449,6 +457,7 @@ export default function Home() {
   const previewUrlsRef = useRef<string[]>([]);
   const loadTokenRef = useRef(0);
   const exportAbortRef = useRef<AbortController | null>(null);
+  const desktop = isNativeDesktop();
 
   const plannedPages = useMemo(
     () => scans.map((scan) => ({ scan, plan: planOutput(scan, settings) })),
@@ -461,6 +470,7 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    void initializeNativePerformanceProfile().catch(() => undefined);
     return () => {
       loadTokenRef.current += 1;
       exportAbortRef.current?.abort();
@@ -479,6 +489,9 @@ export default function Home() {
         setPhase('error');
         return;
       }
+
+      if (desktop)
+        await initializeNativePerformanceProfile().catch(() => undefined);
 
       const token = ++loadTokenRef.current;
       exportAbortRef.current?.abort();
@@ -590,8 +603,22 @@ export default function Home() {
         setStatus('PDF konnte nicht geöffnet werden');
       }
     },
-    [revokePreviews],
+    [desktop, revokePreviews],
   );
+
+  const openNativePdf = useCallback(async () => {
+    try {
+      const file = await pickNativePdf();
+      if (file) await loadFile(file);
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : `Die PDF konnte nicht geöffnet werden: ${String(caught)}`,
+      );
+      setPhase('error');
+    }
+  }, [loadFile]);
 
   const reset = useCallback(async () => {
     ++loadTokenRef.current;
@@ -620,12 +647,14 @@ export default function Home() {
       return window.confirm(
         `${label} umfasst ${formatBytes(totalRaw)} ungefilterte RGB-Daten und kann trotz Beschleunigung lange dauern. ` +
           (directSave
-            ? 'Die Ausgabe wird blockweise direkt in die gewählte Datei geschrieben und nicht komplett im Arbeitsspeicher gesammelt. '
+            ? desktop
+              ? 'Die Windows-App schreibt die Ausgabe blockweise direkt auf den Datenträger und nutzt die verfügbaren Systemressourcen. '
+              : 'Die Ausgabe wird blockweise direkt in die gewählte Datei geschrieben und nicht komplett im Arbeitsspeicher gesammelt. '
             : 'Dieser Browser kann die Ausgabe nicht direkt auf den Datenträger streamen und muss das Ergebnis im Arbeitsspeicher sammeln. ') +
           'Trotzdem starten?',
       );
     },
-    [],
+    [desktop],
   );
 
   const exportSingle = useCallback(
@@ -849,13 +878,14 @@ export default function Home() {
                 Jedes Detail bekommt die Pixel, die es braucht.
               </h1>
               <p className="mt-5 max-w-2xl text-base leading-7 text-muted-foreground sm:text-lg">
-                Die Seite prüft native Bildauflösungen und kleinen Text,
-                berechnet daraus die nötige Ausgabegröße und rendert jede
-                PDF-Seite direkt in deinem Browser.
+                {desktop
+                  ? 'Die Windows-App prüft native Bildauflösungen und kleinen Text, berechnet die nötige Ausgabegröße und schreibt das Ergebnis direkt auf deinen Datenträger.'
+                  : 'Die Seite prüft native Bildauflösungen und kleinen Text, berechnet daraus die nötige Ausgabegröße und rendert jede PDF-Seite direkt in deinem Browser.'}
               </p>
             </div>
             <DropSurface
               onFile={(file) => void loadFile(file)}
+              onNativePick={desktop ? () => void openNativePdf() : undefined}
               dragging={dragging}
               onDraggingChange={setDragging}
             />
@@ -869,6 +899,7 @@ export default function Home() {
           <SettingsPanel
             settings={settings}
             onChange={setSettings}
+            native={desktop}
             disabled={false}
           />
         </section>
@@ -1007,8 +1038,9 @@ export default function Home() {
                       Details werden vermessen
                     </h2>
                     <p className="mt-2 max-w-sm text-sm leading-6 text-muted-foreground">
-                      Der Browser liest Bildabmessungen, Platzierungen und
-                      Textgrößen jeder Seite.
+                      {desktop
+                        ? 'Die App liest Bildabmessungen, Platzierungen und Textgrößen jeder Seite parallel ein.'
+                        : 'Der Browser liest Bildabmessungen, Platzierungen und Textgrößen jeder Seite.'}
                     </p>
                   </div>
                 </div>
@@ -1064,6 +1096,7 @@ export default function Home() {
             <SettingsPanel
               settings={settings}
               onChange={setSettings}
+              native={desktop}
               disabled={Boolean(exportState)}
             />
           </div>
